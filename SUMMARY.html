@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Flaky Network: System Architecture & Design Summary</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; max-width: 950px; margin: 0 auto; padding: 2rem; }
+        h1 { border-bottom: 2px solid #2c3e50; padding-bottom: 0.5rem; color: #2c3e50; }
+        h2 { color: #34495e; margin-top: 2rem; border-bottom: 1px solid #eee; padding-bottom: 0.3rem; }
+        h3 { color: #2980b9; margin-top: 1.5rem; }
+        p { margin-bottom: 1rem; }
+        code { background-color: #f4f4f4; padding: 0.2rem 0.4rem; border-radius: 4px; font-family: monospace; color: #d35400; }
+        .highlight { background-color: #e8f4f8; padding: 1.2rem; border-left: 4px solid #3498db; margin: 1.5rem 0; border-radius: 0 4px 4px 0; }
+        .math-block { background-color: #fdfbf7; padding: 1rem; border: 1px solid #e1d8c1; border-radius: 4px; font-family: monospace; margin-bottom: 1rem; }
+        ul, ol { margin-bottom: 1rem; padding-left: 1.5rem; }
+        li { margin-bottom: 0.5rem; }
+    </style>
+</head>
+<body>
+
+    <h1>System Architecture Summary: The Flaky Network</h1>
+    <p><em>A breakdown of a real-time, low-latency UDP transport protocol.</em></p>
+
+    <h2>1. High-Level Architecture</h2>
+    <p>The system utilizes an asymmetric, real-time UDP streaming architecture designed to achieve the lowest possible playout delay while adhering to a strict 2.0x bandwidth cap. The design completely abandons TCP-like reactive retransmissions (ARQ). In a network where maximum jitter reaches 80ms, a reactive NACK (Negative Acknowledgment) incurs a severe Round-Trip Time (RTT) penalty, requiring a minimum of 40ms to 160ms just for transit. To achieve sub-90ms playout delays, the architecture allocates the entire 2.0x bandwidth budget to proactive <strong>Staggered Duplication</strong>, guaranteeing the redundancy is in flight before the receiver is even aware a drop has occurred.</p>
+
+    <ul>
+        <li><strong>The Sender (Event-Loop Multiplexer):</strong> Instead of blocking synchronously on <code>recvfrom()</code>, the sender operates an event loop driven by <code>poll()</code>. This decouples redundancy generation from the strict 20ms harness clock, allowing the sender to sleep for microsecond-precise intervals and inject arbitrary delays between primary and secondary packet transmissions.</li>
+        <li><strong>The Receiver (Stateless Playout):</strong> The receiver operates with a highly lightweight <code>seen</code> array buffer. It eschews complex jitter buffers and reordering logic. Because redundancy is handled entirely on the wire, the receiver simply forwards the first valid arrival of any sequence number to the harness player; subsequent late or duplicated packets are instantly dropped.</li>
+    </ul>
+
+    <h2>2. The Evolution of the Design</h2>
+    <p>To reach the theoretical physical limits of the network, the redundancy strategy underwent three major iterations to overcome specific network hazards.</p>
+    
+    <h3>Phase 1: Simple Piggybacking (N on N+1)</h3>
+    <p>The initial design appended the payload of Frame <em>N</em> onto the packet for Frame <em>N+1</em>. While this incurred zero computational overhead, it mathematically locked the recovery time to the 20ms generation clock. If Packet <em>N</em> was lost, the backup physically could not leave the sender until <em>t=20ms</em>. Adding network transit time meant the minimum valid delay hovered around 40-50ms, which was too slow.</p>
+
+    <h3>Phase 2: Offset Piggybacking (The Delay Trap)</h3>
+    <p>To combat packet loss, the design initially pivoted to an offset model (e.g., placing Frame <em>N</em> inside Frame <em>N+4</em> or <em>N+5</em>) under the assumption of burst losses. However, network profiling revealed the drops were actually independent events, not burst-correlated. Because this offset model mathematically locked the redundancy to the 20ms frame generation clock, the backup data was artificially delayed at the sender. Testing showed this design produced minimum playout delays of 120ms, rendering it uncompetitive, and it was quickly abandoned.</p>
+
+    <h3>Phase 3: Decoupled Staggered Duplication</h3>
+    <p>The final design abandoned piggybacking entirely. By moving to an event-loop (<code>poll()</code>) architecture, the sender was freed from the 20ms grid. The system now sends standard 164-byte UDP packets. The primary packet is sent at <em>t=0</em>, and a secondary "echo" packet is queued and fired at a precise millisecond offset (e.g., <em>t=1ms</em>). This establishes a tight "race condition," allowing the backup to dodge instantaneous network hiccups while arriving well before a strict 80ms deadline.</p>
+
+    <h2>3. The Strict Mathematics of the Network</h2>
+    
+    <div class="highlight">
+        <strong>Achieved Performance Floor:</strong><br>
+        Profile A: <code>--delay_ms 41</code><br>
+        Profile B: <code>--delay_ms 81</code>
+    </div>
+
+    <h3>The Bandwidth Budget Hack</h3>
+    <p>The 160-byte payload is cryptographically hashed, rendering it perfectly incompressible. The bandwidth cap is strictly <strong>2.0x (320 bytes per frame)</strong>.</p>
+    <div class="math-block">
+        Raw Packet: 164 bytes (4-byte seq + 160-byte payload)<br>
+        100% Duplication: 164 * 2 = 328 bytes (2.05x overhead - INVALID)
+    </div>
+    <p>Because 328 bytes exceeds the 320-byte budget, the sender cannot mathematically afford to duplicate every frame. The architecture solves this using modulo arithmetic, skipping the staggered echo on exactly 1 out of every 20 frames.</p>
+    <div class="math-block">
+        (19 frames * 328 bytes) + (1 frame * 164 bytes) = 6396 bytes per 20 frames<br>
+        6396 / 20 = 319.8 bytes average per frame.<br>
+        319.8 / 160 = <strong>1.99x Overhead (VALID)</strong>
+    </div>
+
+    <h3>The Joint Probability Calculation (The 81ms Floor)</h3>
+    <p>Profile B exhibits a maximum network delay/jitter of 80ms and a baseline drop rate of roughly 5%. The system achieves an 81ms delay by exploiting independent joint probabilities. To fail an 81ms deadline, <strong>both</strong> the primary packet and the staggered echo (sent at <em>t=1ms</em>) must individually fail (either dropped, or delayed beyond 80ms).</p>
+    <ul>
+        <li><strong>Primary Packet (Deadline 81ms):</strong> Fails if dropped (5%) or delayed by 81ms (impossible under Profile B). Failure rate = ~5%.</li>
+        <li><strong>Echo Packet (Deadline 80ms due to 1ms stagger):</strong> Fails if dropped (5%) or delayed by 80ms (a 1-in-60 chance based on uniform 20-80ms jitter). Failure rate = ~6.6%.</li>
+    </ul>
+    <p>Because these are independent network routing events, the probability of <em>both</em> packets failing is their product: <code>0.05 * 0.066 = 0.0033 (0.33%)</code>. Even factoring in the 5% of frames that lack an echo (due to the bandwidth budget), the overall systemic deadline-miss rate resolves to <strong>~0.93%</strong>, safely passing the 1.0% cap.</p>
+
+    <h2>4. System Breaking Points</h2>
+    <p>Because the architecture is highly optimized to ride the absolute limits of the network's physical constraints, it is vulnerable to two specific boundary conditions:</p>
+    <ol>
+        <li><strong>Jitter Physics (The +1ms Failure):</strong> The 81ms score for Profile B is calculated exactly as <code>80ms (Max Network Jitter) + 1ms (Echo Stagger Offset)</code>. If the relay applies an 81ms delay spike to the network, the staggered echo will arrive at 82ms. Therefore, increasing the network's maximum delay by even 1 millisecond mathematically breaks this design, pushing the deadline misses past 1%.</li>
+        <li><strong>The 10% Packet Loss Threshold:</strong> This architecture relies on squaring the packet loss probability. If the network's baseline packet loss increases to 10%, the failure rate of the staggered block becomes <code>0.10 * 0.10 = 0.01 (1.0%)</code>. A loss rate of 15% results in a 2.25% failure rate, rendering the system INVALID. Surviving >10% loss requires abandoning simple duplication for block-based XOR Erasure Coding across 3 or more packets, which would force the minimum playout delay back over 100ms.</li>
+    </ol>
+
+</body>
+</html>

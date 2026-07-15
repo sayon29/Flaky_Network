@@ -1,3 +1,6 @@
+#RUN LOG
+
+```
 sayonmondal@sayon:~/Desktop/Projects/systems_handout$ python3 run.py --profile profiles/A.json --delay_ms 60
 endpoints done
 relay done: {'up_bytes': 246000, 'down_bytes': 0, 'up_pkts': 1500, 'down_pkts': 0, 'dropped': 34, 'duplicated': 10}
@@ -386,4 +389,4 @@ relay done: {'up_bytes': 479700, 'down_bytes': 0, 'up_pkts': 2925, 'down_pkts': 
   playout delay        : 41 ms   <-- your score if valid; lower wins
   bandwidth overhead   : 2.00x   [cap 2.00x]   (up 479700B, feedback 0B)
   RESULT               : VALID
-sayonmondal@sayon:~/Desktop/Projects/systems_handout$ 
+```
